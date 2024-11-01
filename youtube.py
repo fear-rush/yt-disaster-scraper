@@ -1,4 +1,10 @@
-from pytube import YouTube
-YouTube('https://youtu.be/2lAe1cqCOXo').streams.first().download()
-yt = YouTube('http://youtube.com/watch?v=2lAe1cqCOXo')
-yt.streams.filter(progressive=True, file_extension='mp4').order_by('resolution').desc().first().download()
+from pytubefix import Search
+
+results = Search('Github Issue Best Practices')
+
+for video in results.videos:
+  print(f'Title: {video.title}')
+  print(f'URL: {video.watch_url}')
+  print(f'Duration: {video.length} sec')
+  print('---')
+  

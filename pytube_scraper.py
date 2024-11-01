@@ -4,16 +4,14 @@ import logging
 import re
 import whisper
 import warnings
-from pytube import Search
-from pytubefix import YouTube
-from pytubefix.cli import on_progress
+from pytubefix import Search, YouTube
 from typing import List, Dict, Optional
 from datetime import datetime
 
 from dotenv import load_dotenv
 from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled
 
-from sqlalchemy import create_engine, Column, String, Text, DateTime, Boolean
+from sqlalchemy import create_engine, Column, String, Text, DateTime, Boolean, Integer, Null
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.exc import IntegrityError
@@ -37,7 +35,8 @@ class YouTubeTranscriptCorpus(Base):
     id = Column(String(50), primary_key=True)
     title = Column(String(500), nullable=False)
     channel_title = Column(String(500))
-    published_at = Column(DateTime)
+    published_at = Column(DateTime, nullable=True)
+    duration = Column(Integer)  # Duration in seconds
     transcript_text = Column(Text)
     language = Column(String(10))
     has_caption = Column(Boolean, default=False)
@@ -47,8 +46,6 @@ class YouTubeTranscriptScraper:
     def __init__(self):
         """
         Initialize YouTube Transcript Scraper
-        
-        :param database_url: PostgreSQL database connection string
         """
         # Database setup
         self.database_url = os.getenv('POSTGRESQL_URL')
@@ -60,48 +57,93 @@ class YouTubeTranscriptScraper:
         self.Session = sessionmaker(bind=self.engine)
     
     def search_videos(self, 
-                      query: str, 
-                      max_results: int = 50, 
-                      language: str = 'id') -> List[Dict]:
+                     query: str, 
+                     max_results: int = 50, 
+                     language: str = 'id') -> List[Dict]:
         """
-        Search for videos using Pytube Search
+        Search for videos using Pytube Search with pagination support
         
         :param query: Search query
         :param max_results: Maximum number of results to retrieve
-        :param language: Language preference (note: pytube doesn't support language filtering)
-        :return: List of video metadata
+        :param language: Language preference
+        :return: List of video metadata including duration
         """
         videos = []
         try:
-            # Perform initial search
+            # Initialize search
             search = Search(query)
+            initial_results = search.results
+            page_num = 1
+            max_pages = 10  # Safeguard against infinite loops
             
-            # Collect initial results
-            while len(videos) < max_results and len(search.results) > 0:
-                for result in search.results:
+            while len(videos) < max_results and page_num <= max_pages:
+                logger.info(f"Processing page {page_num} of search results for query: {query}")
+                
+                # Process current page results
+                for video in initial_results:
                     if len(videos) >= max_results:
                         break
                     
-                    video_info = {
-                        'id': result.video_id,
-                        'title': result.title,
-                        'channel_title': result.author,
-                        'published_at': datetime.fromtimestamp(result.publish_date.timestamp()) if result.publish_date else None
-                    }
-                    videos.append(video_info)
-                
-                # If we haven't reached max results, try to get next page of results
-                if len(videos) < max_results:
                     try:
-                        search.get_next_results()
+                        # Get full video info using YouTube
+                        video_url = f"https://youtube.com/watch?v={video.video_id}"
+                        yt = YouTube(video_url)
+                        
+                        # Safely get video duration with fallback
+                        try:
+                            duration = yt.length if yt.length is not None else 0
+                        except Exception:
+                            duration = 0
+                            
+                        # Basic content filtering - adjust thresholds as needed
+                        if duration > 7200:  # Skip videos longer than 2 hours
+                            logger.info(f"Skipping long video: {yt.title} ({duration} seconds)")
+                            continue
+                            
+                        # Safely get video metadata with fallbacks
+                        video_info = {
+                            'id': video.video_id,
+                            'title': getattr(yt, 'title', f"Unknown Title ({video.video_id})"),
+                            'channel_title': getattr(yt, 'author', 'Unknown Channel'),
+                            'duration': duration,
+                            'published_at': datetime.fromtimestamp(video.publish_date.timestamp()) if video.publish_date else Null  # Fallback since publish date might not be available
+                        }
+                        
+                        videos.append(video_info)
+                        logger.info(f"Found video: {video_info['title']} (Duration: {video_info['duration']} seconds)")
+                        
+                        # Add delay to prevent rate limiting
+                        time.sleep(0.5)
+                        
                     except Exception as e:
-                        logger.warning(f"No more results available: {e}")
+                        logger.error(f"Error processing video {video.video_id}: {str(e)}")
+                        continue
+                
+                # If we haven't reached max_results, try to get next page
+                if len(videos) < max_results and page_num < max_pages:
+                    try:
+                        # Attempt to get next page of results
+                        logger.info("Fetching next page of results...")
+                        search.get_next_results()
+                        initial_results = search.results
+                        
+                        if not initial_results:
+                            logger.info("No more results available")
+                            break
+                            
+                        page_num += 1
+                        time.sleep(1)  # Add delay between pages
+                        
+                    except Exception as e:
+                        logger.error(f"Error getting next page: {e}")
                         break
+                else:
+                    break
         
         except Exception as e:
-            logger.error(f"Error searching videos with Pytube: {e}")
+            logger.error(f"Error in search process: {e}")
         
-        print(len(videos))
+        logger.info(f"Total videos found: {len(videos)}")
         return videos[:max_results]
 
     def clean_transcript(self, text: str) -> str:
@@ -196,9 +238,10 @@ class YouTubeTranscriptScraper:
         :param video_id: YouTube video ID
         :return: Transcribed text or None
         """
+        temp_audio_path = None
         try:
             youtube_url = f"https://www.youtube.com/watch?v={video_id}"
-            yt = YouTube(youtube_url, on_progress_callback=on_progress)
+            yt = YouTube(youtube_url)
             
             download_dir = os.path.join(os.getcwd(), 'downloaded_audio')
             os.makedirs(download_dir, exist_ok=True)
@@ -210,17 +253,19 @@ class YouTubeTranscriptScraper:
                 try:
                     logger.info(f"Download {yt.title}")
                     
-                    ys = yt.streams.filter(only_audio=True).first()
-                    ys.download(output_path=os.path.dirname(temp_audio_path), filename=f"{video_id}.mp3")
+                    # Get audio stream
+                    audio_stream = yt.streams.filter(only_audio=True).first()
+                    if not audio_stream:
+                        logger.error(f"No audio stream available for video {video_id}")
+                        return None
+                        
+                    audio_stream.download(output_path=download_dir, filename=f"{video_id}.mp3")
                     
                     if os.path.exists(temp_audio_path) and os.path.getsize(temp_audio_path) > 0:
                         # Transcribe audio using Whisper
-                        model = whisper.load_model("turbo")
+                        model = whisper.load_model("base")
                         result = model.transcribe(temp_audio_path, language="id")
                         transcript_text = result['text']
-                        
-                        # Clean up temp file
-                        os.remove(temp_audio_path)
                         
                         return self.clean_transcript(transcript_text)
                     
@@ -231,15 +276,20 @@ class YouTubeTranscriptScraper:
         except Exception as e:
             logger.error(f"Error during Whisper transcription for video {video_id}: {e}")
         
-        if os.path.exists(temp_audio_path):
-            os.remove(temp_audio_path)
+        finally:
+            # Clean up temp file
+            if temp_audio_path and os.path.exists(temp_audio_path):
+                try:
+                    os.remove(temp_audio_path)
+                except Exception as e:
+                    logger.error(f"Error removing temporary audio file: {e}")
             
         return None
     
     def build_corpus(self, 
-                     query: str, 
-                     max_results: int = 50, 
-                     language: str = 'id') -> int:
+                    query: str, 
+                    max_results: int = 50, 
+                    language: str = 'id') -> int:
         """
         Build corpus from YouTube videos
         
@@ -251,7 +301,8 @@ class YouTubeTranscriptScraper:
         session = self.Session()
         try:
             # Search existing entries
-            existing_entries = {entry.id: entry.transcript_text for entry in session.query(YouTubeTranscriptCorpus).all()}
+            existing_entries = {entry.id: entry.transcript_text 
+                              for entry in session.query(YouTubeTranscriptCorpus).all()}
             
             videos = self.search_videos(query, max_results, language)
             processed_count = 0
@@ -261,7 +312,7 @@ class YouTubeTranscriptScraper:
                 video_title = video['title']
 
                 if video_id in existing_entries:
-                    logger.info(f"Skipping already processed video: {video_title} (ID: {video_id})")
+                    logger.info(f"Skipping already processed video: {video_title}")
                     continue
                 
                 transcript_data = self.get_transcript(video_id)
@@ -269,8 +320,9 @@ class YouTubeTranscriptScraper:
                 if transcript_data and transcript_data['transcript_text']:
                     transcript_text = transcript_data['transcript_text']
 
-                    if any(existing_transcript == transcript_text for existing_transcript in existing_entries.values()):
-                        logger.info(f"Skipping duplicate transcript for video: {video_title}")
+                    if any(existing_transcript == transcript_text 
+                          for existing_transcript in existing_entries.values()):
+                        logger.info(f"Skipping duplicate transcript: {video_title}")
                         continue
 
                     corpus_entry = YouTubeTranscriptCorpus(
@@ -278,6 +330,7 @@ class YouTubeTranscriptScraper:
                         title=video_title,
                         channel_title=video['channel_title'],
                         published_at=video['published_at'],
+                        duration=video['duration'],
                         transcript_text=transcript_text,
                         language=transcript_data.get('language', 'unknown'),
                         has_caption=transcript_data.get('has_caption', False)
@@ -287,10 +340,10 @@ class YouTubeTranscriptScraper:
                         session.add(corpus_entry)
                         session.commit()
                         processed_count += 1
-                        logger.info(f"Processed video: {video_title}")
+                        logger.info(f"Processed: {video_title} ({video['duration']}s)")
                     except IntegrityError as e:
                         session.rollback()
-                        logger.error(f"Error inserting data for video {video_id}: {str(e)}")
+                        logger.error(f"Database error for {video_id}: {str(e)}")
 
                 # Prevent rate limiting
                 time.sleep(1)
@@ -302,9 +355,8 @@ class YouTubeTranscriptScraper:
         finally:
             session.close()
         
-        logger.info(f"Total processed videos for query '{query}': {processed_count}")
+        logger.info(f"Processed {processed_count} videos for query '{query}'")
         return processed_count
-
 
 def main():
     # Initialize scraper
@@ -327,6 +379,8 @@ def main():
         logger.info(f"Processing query: {query}")
         processed = scraper.build_corpus(query, max_results=100)
         total_processed += processed
+        # Add delay between queries
+        time.sleep(2)
     
     logger.info(f"Overall total processed videos: {total_processed}")
 
