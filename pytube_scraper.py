@@ -48,7 +48,7 @@ class YouTubeTranscriptScraper:
         Initialize YouTube Transcript Scraper
         """
         # Database setup
-        self.database_url = os.getenv('POSTGRESQL_URL')
+        self.database_url = os.getenv('DATABASE_URL')
         if not self.database_url:
             raise ValueError("No database URL provided")
         
@@ -113,7 +113,7 @@ class YouTubeTranscriptScraper:
                         logger.info(f"Found video: {video_info['title']} (Duration: {video_info['duration']} seconds)")
                         
                         # Add delay to prevent rate limiting
-                        time.sleep(0.5)
+                        time.sleep(1)
                         
                     except Exception as e:
                         logger.error(f"Error processing video {video.video_id}: {str(e)}")
@@ -263,7 +263,7 @@ class YouTubeTranscriptScraper:
                     
                     if os.path.exists(temp_audio_path) and os.path.getsize(temp_audio_path) > 0:
                         # Transcribe audio using Whisper
-                        model = whisper.load_model("base")
+                        model = whisper.load_model("turbo")
                         result = model.transcribe(temp_audio_path, language="id")
                         transcript_text = result['text']
                         
@@ -377,7 +377,7 @@ def main():
     total_processed = 0
     for query in queries:
         logger.info(f"Processing query: {query}")
-        processed = scraper.build_corpus(query, max_results=100)
+        processed = scraper.build_corpus(query, max_results=500)
         total_processed += processed
         # Add delay between queries
         time.sleep(2)

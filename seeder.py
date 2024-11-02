@@ -1,7 +1,12 @@
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from dotenv import load_dotenv
+import os
 
-NEW_DATABASE_URL = "postgresql://user:password@localhost:5432/newdatabase"
+
+load_dotenv()
+
+NEW_DATABASE_URL = os.getenv('DATABASE_URL')
 
 engine = create_engine(NEW_DATABASE_URL)
 Session = sessionmaker(bind=engine)
@@ -9,7 +14,7 @@ Session = sessionmaker(bind=engine)
 def seed_database_from_file(sql_file_path: str):
     session = Session()
     try:
-        with open(sql_file_path, "r") as file:
+        with open(sql_file_path, "r", encoding="utf-8") as file:
             sql_commands = file.read()
         
         with engine.connect() as connection:
@@ -22,4 +27,4 @@ def seed_database_from_file(sql_file_path: str):
         session.close()
 
 if __name__ == "__main__":
-    seed_database_from_file("youtube_transcript_data.sql")
+    seed_database_from_file("youtube_transcript_corpus.sql")
